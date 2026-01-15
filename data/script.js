@@ -21,6 +21,25 @@ function sendCompassValue(pos) {
 	console.log("Compass value", pos);	// Log the compass value to the console for debugging
 }
 
+// Function to turn to a specific degree (0-360) using Dir:degree command
+function turnToDegree() {
+	const degreeInput = document.getElementById('degreeInput');
+	const degree = parseFloat(degreeInput.value);
+	
+	if (isNaN(degree) || degree < 0 || degree > 360) {
+		alert("Please enter a valid degree between 0 and 360");
+		return;
+	}
+	
+	// Normalize to 0-360
+	let normalizedDegree = degree;
+	while(normalizedDegree < 0) normalizedDegree += 360;
+	while(normalizedDegree >= 360) normalizedDegree -= 360;
+	
+	fetch(`/dir?value=${normalizedDegree}`);	// Send the Dir:degree command to the server
+	console.log("Turn to degree:", normalizedDegree);	// Log the degree to the console for debugging
+}
+
 
 // Functions for moving the motor forward and backward with specific distances
 function forwards5() { move('forwards', 5); } 		// Calling move function with separated parameters

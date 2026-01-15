@@ -1,5 +1,6 @@
 #include <Wire.h>
 #include <LiquidCrystal.h>
+#include <math.h>
 
 // ===================== LCD =====================
 LiquidCrystal lcd(23,25,27,29,31,33); 
@@ -30,6 +31,22 @@ ControlMode currentMode = JOYSTICK;
 
 // ===================== GLOBAL VARIABLES =====================
 String espBuffer = "";
+String serialBuffer = "";
+
+// ===================== ENCODER PINS =====================
+// Using standard interrupt-capable pins (can be disabled if encoders not connected)
+#define ENCODER_L_A 2   // Left encoder channel A (interrupt pin)
+#define ENCODER_L_B 3   // Left encoder channel B
+#define ENCODER_R_A 20  // Right encoder channel A (interrupt pin)
+#define ENCODER_R_B 21  // Right encoder channel B
+
+volatile long encoderLeftCount = 0;
+volatile long encoderRightCount = 0;
+long lastEncoderLeft = 0;
+long lastEncoderRight = 0;
+
+// Encoder calibration: pulses per cm (adjust based on your wheel/encoder setup)
+#define PULSES_PER_CM 10  // Example: 10 pulses per cm, adjust experimentally
 
 // ===================== FUNCTION PROTOTYPES =====================
 void setMotors(int leftSpeed, int rightSpeed);
@@ -41,8 +58,14 @@ void faceNorth();
 void readJoystick();
 void checkModeSwitch();
 void handleESPCommand(String msg);
+void handleSerialCommand(String msg);
 void driveDistanceCM(int cm);
+void driveDistanceCMEncoder(int cm);
 void turnToDegree(float deg);
+String getDirectionString(float heading);
+void updateLCD();
+void encoderLeftISR();
+void encoderRightISR();
 
 // ===================== MOTOR CONTROL =====================
 void setMotors(int leftSpeed, int rightSpeed){
@@ -92,17 +115,20 @@ bool turnToHeading(float target){
   
   float diff = fmod((target - current + 540.0), 360.0) - 180.0;
   float absDiff = abs(diff);
+  
+  // Use +/- 1 degree tolerance (e.g., 119-121 for target 120)
+  if(absDiff <= 1.0) {
+    stopMotors();
+    return true;
+  }
+  
   bool turnRight = diff > 0;
 
   // Motor speed based on heading error
   if(absDiff > 25) setMotors(turnRight ? 200 : -200, turnRight ? -200 : 200);
   else if(absDiff > 10) setMotors(turnRight ? 120 : -120, turnRight ? -120 : 120);
   else if(absDiff > 4) setMotors(turnRight ? 80 : -80, turnRight ? -80 : 80);
-  else if(absDiff > 1.5) setMotors(turnRight ? 50 : -50, turnRight ? -50 : 50);
-  else { 
-    stopMotors(); 
-    return true; 
-  }
+  else setMotors(turnRight ? 50 : -50, turnRight ? -50 : 50);
 
   return false;
 }
@@ -115,12 +141,57 @@ void faceNorth(){
   stopMotors();
 }
 
+// ===================== ENCODER INTERRUPTS =====================
+void encoderLeftISR(){
+  if(digitalRead(ENCODER_L_B) == HIGH) encoderLeftCount++;
+  else encoderLeftCount--;
+}
+
+void encoderRightISR(){
+  if(digitalRead(ENCODER_R_B) == HIGH) encoderRightCount++;
+  else encoderRightCount--;
+}
+
 // ===================== DRIVE =====================
 void driveDistanceCM(int cm){
+  // Try encoder-based first, fallback to timing-based
+  driveDistanceCMEncoder(cm);
+}
+
+void driveDistanceCMEncoder(int cm){
   if(cm == 0) return;
+  
+  // Reset encoder counts
+  encoderLeftCount = 0;
+  encoderRightCount = 0;
+  lastEncoderLeft = 0;
+  lastEncoderRight = 0;
+  
   int dir = cm > 0 ? 1 : -1;
+  long targetPulses = abs(cm) * PULSES_PER_CM;
+  
   setMotors(dir * motorSpeedPWM, dir * motorSpeedPWM);
-  delay(abs(cm) * 50); // simple timing, adjust experimentally
+  
+  // Wait until target distance reached
+  long avgPulses = 0;
+  unsigned long startTime = millis();
+  unsigned long timeout = abs(cm) * 200; // timeout fallback (ms)
+  
+  while(true){
+    avgPulses = (abs(encoderLeftCount) + abs(encoderRightCount)) / 2;
+    
+    if(avgPulses >= targetPulses){
+      break;
+    }
+    
+    // Timeout fallback if encoders not working
+    if(millis() - startTime > timeout){
+      break;
+    }
+    
+    delay(10);
+  }
+  
   stopMotors();
 }
 
@@ -134,15 +205,43 @@ void turnToDegree(float deg){
 
 // ===================== READ JOYSTICK =====================
 void readJoystick(){
-  int x = analogRead(JOY_X) - 512;  // left/right
-  int y = 512 - analogRead(JOY_Y);  // forward/backward
+  int xRaw = analogRead(JOY_X);
+  int yRaw = analogRead(JOY_Y);
+  
+  // Center values (adjust if your joystick center is different)
+  int centerX = 512;
+  int centerY = 512;
+  int deadZone = 20; // Dead zone to prevent drift
+  
+  int x = xRaw - centerX;  // left/right
+  int y = centerY - yRaw;  // forward/backward
   x = -x; // invert direction if needed
-
+  
+  // Calculate distance from center
+  float distance = sqrt(x*x + y*y);
+  float maxDistance = sqrt(512*512 + 512*512); // Maximum possible distance
+  
+  // Apply dead zone
+  if(abs(x) < deadZone) x = 0;
+  if(abs(y) < deadZone) y = 0;
+  
+  // Scale speed based on distance from center (0 to maxSpeed)
+  float speedFactor = constrain(distance / maxDistance, 0.0, 1.0);
+  int currentMaxSpeed = (int)(motorSpeedPWM * speedFactor);
+  
+  // Calculate differential drive speeds
   int leftSpeed  = y + x;
   int rightSpeed = y - x;
-
-  leftSpeed  = map(constrain(leftSpeed, -512, 512), -512, 512, -motorSpeedPWM, motorSpeedPWM);
-  rightSpeed = map(constrain(rightSpeed, -512, 512), -512, 512, -motorSpeedPWM, motorSpeedPWM);
+  
+  // Normalize and scale
+  int maxInput = max(abs(leftSpeed), abs(rightSpeed));
+  if(maxInput > 0){
+    leftSpeed  = map(leftSpeed, -512, 512, -currentMaxSpeed, currentMaxSpeed);
+    rightSpeed = map(rightSpeed, -512, 512, -currentMaxSpeed, currentMaxSpeed);
+  } else {
+    leftSpeed = 0;
+    rightSpeed = 0;
+  }
 
   setMotors(leftSpeed, rightSpeed);
 }
@@ -160,6 +259,33 @@ void checkModeSwitch(){
   lastBtn = currBtn;
 }
 
+// ===================== GET DIRECTION STRING =====================
+String getDirectionString(float heading){
+  if(heading >= 337.5 || heading < 22.5) return "N";
+  else if(heading >= 22.5 && heading < 67.5) return "NE";
+  else if(heading >= 67.5 && heading < 112.5) return "E";
+  else if(heading >= 112.5 && heading < 157.5) return "SE";
+  else if(heading >= 157.5 && heading < 202.5) return "S";
+  else if(heading >= 202.5 && heading < 247.5) return "SW";
+  else if(heading >= 247.5 && heading < 292.5) return "W";
+  else return "NW";
+}
+
+// ===================== UPDATE LCD =====================
+void updateLCD(){
+  float heading = getHeading();
+  String dir = getDirectionString(heading);
+  
+  lcd.setCursor(0,1);
+  lcd.print("H:");
+  if(heading < 100) lcd.print(" ");
+  if(heading < 10) lcd.print(" ");
+  lcd.print(heading, 0);
+  lcd.print(" ");
+  lcd.print(dir);
+  lcd.print("      "); // Clear remaining characters
+}
+
 // ===================== HANDLE ESP COMMAND =====================
 void handleESPCommand(String msg){
   msg.trim();
@@ -173,13 +299,51 @@ void handleESPCommand(String msg){
   else if(msg.startsWith("Turn:")){
     float deg = msg.substring(5).toFloat();
     turnToDegree(deg);
-  } 
+  }
+  else if(msg.startsWith("Dir:")){
+    float deg = msg.substring(4).toFloat();
+    // Normalize to 0-360
+    while(deg < 0) deg += 360;
+    while(deg >= 360) deg -= 360;
+    turnToDegree(deg);
+  }
   else if(msg == "find:North"){
     faceNorth();
   } 
   else if(msg.startsWith("Speed:")){
     int s = msg.substring(6).toInt();
     if(s >= 0 && s <= 255) motorSpeedPWM = s;
+  }
+}
+
+// ===================== HANDLE SERIAL COMMAND =====================
+void handleSerialCommand(String msg){
+  msg.trim();
+  
+  if(msg.startsWith("Move:")){
+    int cm = msg.substring(5).toInt();
+    driveDistanceCM(cm);
+  } 
+  else if(msg.startsWith("Turn:")){
+    float deg = msg.substring(5).toFloat();
+    turnToDegree(deg);
+  }
+  else if(msg.startsWith("Dir:")){
+    float deg = msg.substring(4).toFloat();
+    // Normalize to 0-360
+    while(deg < 0) deg += 360;
+    while(deg >= 360) deg -= 360;
+    turnToDegree(deg);
+  }
+  else if(msg == "find:North" || msg == "North"){
+    faceNorth();
+  } 
+  else if(msg.startsWith("Speed:")){
+    int s = msg.substring(6).toInt();
+    if(s >= 0 && s <= 255) motorSpeedPWM = s;
+  }
+  else {
+    Serial.println("Commands: Move:cm, Turn:deg, Dir:deg, find:North, Speed:0-255");
   }
 }
 
@@ -196,6 +360,14 @@ void setup(){
   pinMode(MOTOR_R_PWM_PIN, OUTPUT);
   pinMode(JOY_BTN, INPUT_PULLUP);
 
+  // Setup encoders (comment out if encoders not connected)
+  pinMode(ENCODER_L_A, INPUT_PULLUP);
+  pinMode(ENCODER_L_B, INPUT_PULLUP);
+  pinMode(ENCODER_R_A, INPUT_PULLUP);
+  pinMode(ENCODER_R_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_L_A), encoderLeftISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_R_A), encoderRightISR, RISING);
+
   stopMotors();
 
   lcd.begin(16,2);
@@ -210,8 +382,9 @@ void setup(){
   lcd.clear();
   lcd.setCursor(0,0);
   lcd.print("Mode: Joystick");
-  lcd.setCursor(0,1);
-  lcd.print("Ready");
+  updateLCD();
+  
+  Serial.println("Ready! Commands: Move:cm, Turn:deg, Dir:deg, find:North, Speed:0-255");
 }
 
 // ===================== LOOP =====================
@@ -233,8 +406,18 @@ void loop(){
     else espBuffer += c;
   }
 
-  // Update LCD: heading
-  lcd.setCursor(0,1);
-  lcd.print("H:");
-  lcd.print(getHeading(), 0);
+  // Handle Serial commands (works in both modes)
+  if(Serial.available()){
+    char c = Serial.read();
+    if(c == '\n' || c == '\r'){
+      if(serialBuffer.length() > 0){
+        handleSerialCommand(serialBuffer);
+        serialBuffer = "";
+      }
+    } 
+    else serialBuffer += c;
+  }
+
+  // Update LCD: heading and direction
+  updateLCD();
 }

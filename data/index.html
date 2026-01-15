@@ -23,5 +23,9 @@
 		and when you finish pressing and/or moving the mouse button, it calls the sendCompassValue() function.-->
 		<input type="range" min="-360" max="360" step="5" id="compassSlider" oninput="updateCompass(this.value)" onchange="sendCompassValue(this.value)" value="0"/>	
 		<div id="compassValue">0°</div>		<!-- This shows the current/last requested compass turning value -->
+	<h1>Turn to Degree</h1>
+		<!-- Input field to turn to a specific degree (0-360) -->
+		<input type="number" min="0" max="360" step="1" id="degreeInput" placeholder="Enter degree (0-360)" style="padding: 10px; font-size: 18px; width: 200px;"/>
+		<button class="button" onclick="turnToDegree()" style="margin-top: 10px;">Turn to Degree</button>
 </body>
 </html>
