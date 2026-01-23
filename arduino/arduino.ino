@@ -15,7 +15,7 @@ LiquidCrystal lcd(23,25,27,29,31,33);
 
 // ===================== COMPASS =====================
 #define CMPS14_ADDRESS 0x60
-float compassOffset = 0; // automatically calculated in setup
+float compassOffset = 90; // automatically calculated in setup
 
 // ===================== MOTOR SPEED =====================
 int motorSpeedPWM = 200; // default PWM speed
